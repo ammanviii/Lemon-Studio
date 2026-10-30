@@ -1,6 +1,7 @@
 // Copyright (C) 2026 ItsAlphaNeon
 // Copyright (C) 2026 thacer13
 // Copyright (C) 2026 Samrat Dutta
+// Copyright (C) 2026 Ammanuel Getenet
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
@@ -1764,7 +1765,10 @@ impl App {
     /// written (not the project), once the project's state is gathered.
     fn write_project(&mut self, target: PathBuf, edit: &mut dyn FnMut(&mut os_model::Project)) -> Option<u64> {
         // A file saved over is kept as an "overwritten on" backup (spec: ui/settings-choices.md "Backup files").
-        crate::backup::keep_overwritten(&target, crate::data_folder::backup_folder(&self.state, Some(&target)));
+        if let Err(e) = crate::backup::keep_overwritten(&target, crate::data_folder::backup_folder(&self.state, Some(&target))) {
+            self.state.message = Some(format!("Save failed: could not back up the previous file: {e}"));
+            return None;
+        }
         // Sampler channels keep their sample and settings in Lemon Sampler: copy them to the channel so the FLP stores
         // them.
         for row in self.state.hosted_rows.clone() {
@@ -1834,7 +1838,7 @@ impl App {
         let result = os_flp::project::apply(&proj, &mut file)
             .map_err(|e| e.to_string())
             .and_then(|()| file.to_bytes().map_err(|e| e.to_string()))
-            .and_then(|b| std::fs::write(&target, &b).map(|()| b.len() as u64).map_err(|e| e.to_string()));
+            .and_then(|b| crate::project_write::write_atomic(&target, &b).map(|()| b.len() as u64).map_err(|e| e.to_string()));
         s.message = Some(match &result {
             Ok(_) if lost.is_empty() => format!("Saved {}", target.display()),
             Ok(_) => format!("Saved {} (not stored yet: {})", target.display(), lost.join(", ")),

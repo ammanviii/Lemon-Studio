@@ -1,4 +1,5 @@
 // Copyright (C) 2026 ItsAlphaNeon
+// Copyright (C) 2026 Ammanuel Getenet
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
@@ -104,12 +105,14 @@ pub fn prune(dir: &Path, name: &str, max: usize) {
 
 /// Before the project is saved over `target`: an existing file there is copied to the backup folder `dir` as
 /// `<name> (overwritten on ...).flp` (a copy of that name made earlier in the same minute is kept).
-pub fn keep_overwritten(target: &Path, dir: Option<PathBuf>) {
-    let Some(dir) = dir.filter(|_| target.is_file()) else { return };
+pub fn keep_overwritten(target: &Path, dir: Option<PathBuf>) -> std::io::Result<()> {
+    let Some(dir) = dir.filter(|_| target.is_file()) else { return Ok(()) };
     let to = dir.join(file_name(&project_name(Some(target)), "overwritten", chrono::Local::now().naive_local()));
-    if !to.exists() && std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::copy(target, to);
+    if !to.exists() {
+        std::fs::create_dir_all(&dir)?;
+        crate::project_write::write_atomic(&to, &std::fs::read(target)?)?;
     }
+    Ok(())
 }
 
 impl App {
@@ -172,6 +175,22 @@ mod tests {
     use super::*;
     use crate::app::Action;
     use crate::views::settings::{self, SAct};
+
+    #[test]
+    fn a_failed_backup_prevents_overwriting_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("song.flp");
+        let blocked = dir.path().join("not-a-folder");
+        std::fs::write(&target, b"original project").unwrap();
+        std::fs::write(&blocked, b"occupied").unwrap();
+        TEST_DIR.with(|d| *d.borrow_mut() = Some(blocked));
+        let mut app = App::new(None);
+        app.save_to(target.clone());
+        TEST_DIR.with(|d| *d.borrow_mut() = None);
+        assert!(app.state.message.as_deref().unwrap_or_default().contains("could not back up"));
+        assert_eq!(std::fs::read(target).unwrap(), b"original project");
+        assert!(app.state.path.is_none(), "a failed save is not marked saved");
+    }
 
     fn at(m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(2026, m, d).unwrap().and_hms_opt(h, min, 30).unwrap()
