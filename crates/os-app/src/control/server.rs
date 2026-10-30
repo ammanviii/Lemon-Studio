@@ -1,4 +1,5 @@
 // Copyright (C) 2026 thacer13
+// Copyright (C) 2026 Ammanuel Getenet
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
@@ -7,68 +8,77 @@
 //! thread that reads it; requests go to the UI thread, which answers them on its tick (`App::control_tick`), so they
 //! see and change the project as the interface does. Only this machine can connect.
 
-use std::io::{BufRead, BufReader, Write};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::io::{self, BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    mpsc::{Receiver, SyncSender, sync_channel},
+};
+use std::time::{Duration, Instant};
 
-use super::rpc::Client;
 use super::Level;
+use super::rpc::Client;
 
-/// A request line from connection `conn`, and where its answer goes.
+pub const MAX_CLIENTS: usize = 16;
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// The connection owns its client state. No disconnected clients accumulate in the UI thread.
 pub struct Request {
     pub conn: u64,
     pub line: String,
-    pub reply: Sender<String>,
+    pub client: Option<Client>,
+    pub reply: SyncSender<(Option<String>, Client)>,
 }
 
-/// The UI thread's end: requests waiting, and the clients connected.
 pub struct Server {
     pub rx: Receiver<Request>,
     pub level: Level,
-    /// Serving without a window (`--serve`): there is no one to ask, so clients save the project themselves.
     pub headless: bool,
-    pub clients: std::collections::HashMap<u64, Client>,
-    /// Where it listens, as the hint bar names it.
     pub at: String,
-    /// On a port, the token a client gives in `hello` before anything else: every program on the computer can reach a
-    /// port (a web page too), not only this user's. A socket path needs none (only this user can open it).
     pub token: Option<String>,
 }
 
-/// A token no one can guess: 128 bits from the standard library's random hash keys.
-fn new_token() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let half = || {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
-        h.finish()
-    };
-    format!("{:016x}{:016x}", half(), half())
+fn new_token() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Starts listening at `at` (a socket path, or a port number); `wake` wakes the UI thread when a request comes.
-pub fn start(at: &str, level: Level, wake: fn()) -> std::io::Result<Server> {
-    let (tx, rx) = channel::<Request>();
+/// Starts a bounded local control listener. Existing live Unix sockets are never unlinked.
+pub fn start(at: &str, level: Level, wake: fn()) -> io::Result<Server> {
+    let (tx, rx) = sync_channel::<Request>(MAX_CLIENTS);
+    let active = Arc::new(AtomicUsize::new(0));
     let shown;
-    let token = at.parse::<u16>().is_ok().then(new_token);
+    let token = if at.parse::<u16>().is_ok() { Some(new_token()?) } else { None };
     #[cfg(unix)]
     {
         if at.parse::<u16>().is_ok() {
-            shown = tcp(at, tx, wake)?;
+            shown = tcp(at, tx, active, wake)?;
         } else {
-            // A socket left by an earlier run that ended without removing it goes; any other file stays (bind fails).
-            use std::os::unix::fs::FileTypeExt;
+            use std::os::unix::{
+                fs::{FileTypeExt, PermissionsExt},
+                net::{UnixListener, UnixStream},
+            };
             if std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_socket()) {
-                let _ = std::fs::remove_file(at);
+                match UnixStream::connect(at) {
+                    Ok(_) => return Err(io::Error::new(io::ErrorKind::AddrInUse, "control socket is already serving")),
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => std::fs::remove_file(at)?,
+                    Err(e) => return Err(e),
+                }
             }
-            let l = std::os::unix::net::UnixListener::bind(at)?;
-            // Only this user may connect.
-            use std::os::unix::fs::PermissionsExt;
+            let l = UnixListener::bind(at)?;
             std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o600))?;
             shown = at.to_string();
             std::thread::Builder::new().name("control".into()).spawn(move || {
                 for (conn, s) in l.incoming().flatten().enumerate() {
+                    let Some(permit) = Permit::take(&active) else { continue };
+                    if s.set_read_timeout(Some(IO_TIMEOUT)).is_err() || s.set_write_timeout(Some(IO_TIMEOUT)).is_err() {
+                        continue;
+                    }
                     if let Ok(w) = s.try_clone() {
-                        serve(conn as u64 + 1, BufReader::new(s), w, tx.clone(), wake);
+                        serve(conn as u64 + 1, BufReader::new(s), w, tx.clone(), permit, wake);
                     }
                 }
             })?;
@@ -76,45 +86,131 @@ pub fn start(at: &str, level: Level, wake: fn()) -> std::io::Result<Server> {
     }
     #[cfg(not(unix))]
     {
-        shown = tcp(at, tx, wake)?;
+        shown = tcp(at, tx, active, wake)?;
     }
-    Ok(Server { rx, level, headless: false, clients: Default::default(), at: shown, token })
+    Ok(Server {
+        rx,
+        level,
+        headless: false,
+        at: shown,
+        token,
+    })
 }
 
-fn tcp(at: &str, tx: Sender<Request>, wake: fn()) -> std::io::Result<String> {
-    let port: u16 = at.parse().map_err(|_| std::io::Error::other(format!("not a port: {at}")))?;
+fn tcp(at: &str, tx: SyncSender<Request>, active: Arc<AtomicUsize>, wake: fn()) -> io::Result<String> {
+    let port: u16 = at.parse().map_err(|_| io::Error::other(format!("not a port: {at}")))?;
     let l = std::net::TcpListener::bind(("127.0.0.1", port))?;
     let shown = l.local_addr()?.to_string();
     std::thread::Builder::new().name("control".into()).spawn(move || {
         for (conn, s) in l.incoming().flatten().enumerate() {
+            let Some(permit) = Permit::take(&active) else { continue };
+            if s.set_read_timeout(Some(IO_TIMEOUT)).is_err() || s.set_write_timeout(Some(IO_TIMEOUT)).is_err() {
+                continue;
+            }
             if let Ok(w) = s.try_clone() {
-                serve(conn as u64 + 1, BufReader::new(s), w, tx.clone(), wake);
+                serve(conn as u64 + 1, BufReader::new(s), w, tx.clone(), permit, wake);
             }
         }
     })?;
     Ok(shown)
 }
 
-/// One connection's thread: each line to the UI thread, each answer back.
-fn serve<R: BufRead + Send + 'static, W: Write + Send + 'static>(conn: u64, r: R, mut w: W, tx: Sender<Request>, wake: fn()) {
+struct Permit(Arc<AtomicUsize>);
+impl Permit {
+    fn take(active: &Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_CLIENTS).then_some(n + 1))
+            .ok()?;
+        Some(Self(active.clone()))
+    }
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Bound allocation before JSON parsing, even for a peer that never sends a newline.
+fn read_line(r: &mut impl BufRead) -> io::Result<Option<String>> {
+    let waiting = Instant::now();
+    let mut started: Option<Instant> = None;
+    let mut bytes = Vec::new();
+    loop {
+        if started.is_some_and(|s| s.elapsed() >= IO_TIMEOUT) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "request took too long"));
+        }
+        let buf = match r.fill_buf() {
+            Err(e)
+                if bytes.is_empty()
+                    && matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+                    && waiting.elapsed() < IDLE_TIMEOUT =>
+            {
+                continue;
+            }
+            other => other?,
+        };
+        if buf.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete request"))
+            };
+        }
+        started.get_or_insert_with(Instant::now);
+        let newline = buf.iter().position(|b| *b == b'\n');
+        let n = newline.map_or(buf.len(), |n| n + 1);
+        if bytes.len() + n > MAX_LINE_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "request exceeds 1 MiB"));
+        }
+        bytes.extend_from_slice(&buf[..n]);
+        r.consume(n);
+        if newline.is_some() {
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+    }
+}
+
+fn serve<R: BufRead + Send + 'static, W: Write + Send + 'static>(
+    conn: u64,
+    mut r: R,
+    mut w: W,
+    tx: SyncSender<Request>,
+    permit: Permit,
+    wake: fn(),
+) {
     let _ = std::thread::Builder::new().name(format!("control {conn}")).spawn(move || {
-        for line in r.lines() {
-            let Ok(line) = line else { break };
+        let _permit = permit;
+        let mut client = None;
+        while let Ok(Some(line)) = read_line(&mut r) {
             if line.trim().is_empty() {
                 continue;
             }
-            // Not JSON (an HTTP request a web page sent to the port): one parse error, and the connection closes.
             if serde_json::from_str::<serde_json::Value>(&line).is_err() {
-                let _ = writeln!(w, "{}", serde_json::json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "not JSON: closing"}}));
+                let _ = writeln!(
+                    w,
+                    "{}",
+                    serde_json::json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "not JSON: closing"}})
+                );
                 break;
             }
-            let (reply, answer) = channel();
-            if tx.send(Request { conn, line, reply }).is_err() {
+            let (reply, answer) = sync_channel(1);
+            if tx
+                .try_send(Request {
+                    conn,
+                    line,
+                    client: client.take(),
+                    reply,
+                })
+                .is_err()
+            {
                 break;
             }
             wake();
-            // A notification gets no answer: the UI thread drops `reply`.
-            if let Ok(a) = answer.recv() {
+            let Ok((a, c)) = answer.recv_timeout(IO_TIMEOUT) else { break };
+            client = Some(c);
+            if let Some(a) = a {
                 if writeln!(w, "{a}").and_then(|_| w.flush()).is_err() {
                     break;
                 }
@@ -124,27 +220,83 @@ fn serve<R: BufRead + Send + 'static, W: Write + Send + 'static>(conn: u64, r: R
 }
 
 impl crate::app::App {
-    /// Answers `server`'s clients from now on.
     pub fn listen(&mut self, server: Server) {
         self.rpc_server = Some(server);
         self.state.control.watched = true;
     }
 
-    /// Answers the requests waiting (on every tick).
     pub fn control_tick(&mut self) {
-        let Some(mut server) = self.rpc_server.take() else { return };
-        while let Ok(req) = server.rx.try_recv() {
-            let level = server.level;
-            let headless = server.headless;
-            let token = server.token.clone();
-            let mut client =
-                server.clients.remove(&req.conn).unwrap_or_else(|| Client { name: format!("Client {}", req.conn), level, saves: headless, token });
-            if let Some(a) = self.rpc_line(&mut client, &req.line) {
-                let _ = req.reply.send(a);
-            }
-            server.clients.insert(req.conn, client);
+        let Some(server) = self.rpc_server.take() else { return };
+        // A busy client cannot keep this tick draining forever.
+        for _ in 0..MAX_CLIENTS {
+            let Ok(req) = server.rx.try_recv() else { break };
+            let mut client = req.client.unwrap_or_else(|| Client {
+                name: format!("Client {}", req.conn),
+                level: server.level,
+                saves: server.headless,
+                token: server.token.clone(),
+            });
+            let answer = self.rpc_line(&mut client, &req.line);
+            let _ = req.reply.send((answer, client));
         }
         self.rpc_server = Some(server);
+    }
+}
+
+#[cfg(test)]
+mod limits_tests {
+    use super::*;
+
+    #[test]
+    fn frames_are_bounded_before_a_newline_and_incomplete_frames_are_refused() {
+        let mut oversize = io::Cursor::new(vec![b'x'; MAX_LINE_BYTES + 1]);
+        assert_eq!(read_line(&mut oversize).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(read_line(&mut io::Cursor::new(b"{}".as_slice())).is_err());
+        assert_eq!(read_line(&mut io::Cursor::new(b"{}\n".as_slice())).unwrap(), Some("{}\n".into()));
+        let mut maximum = vec![b' '; MAX_LINE_BYTES];
+        maximum[MAX_LINE_BYTES - 1] = b'\n';
+        assert_eq!(read_line(&mut io::Cursor::new(maximum)).unwrap().unwrap().len(), MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn idle_timeouts_are_tolerated_but_partial_frame_timeouts_close_the_connection() {
+        struct Scripted(std::collections::VecDeque<Option<Vec<u8>>>);
+        impl io::Read for Scripted {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                unreachable!()
+            }
+        }
+        impl BufRead for Scripted {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if self.0.front() == Some(&None) {
+                    self.0.pop_front();
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "socket timeout"));
+                }
+                Ok(self.0.front().and_then(Option::as_deref).unwrap_or_default())
+            }
+            fn consume(&mut self, amount: usize) {
+                let Some(Some(bytes)) = self.0.front_mut() else { return };
+                bytes.drain(..amount);
+                if bytes.is_empty() {
+                    self.0.pop_front();
+                }
+            }
+        }
+        let mut idle = Scripted([None, Some(b"{}\n".to_vec())].into());
+        assert_eq!(read_line(&mut idle).unwrap(), Some("{}\n".into()));
+        let mut partial = Scripted([Some(b"{".to_vec()), None].into());
+        assert_eq!(read_line(&mut partial).unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn connection_slots_return_after_disconnect_or_spawn_failure() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut permits: Vec<_> = (0..MAX_CLIENTS).map(|_| Permit::take(&active).unwrap()).collect();
+        assert!(Permit::take(&active).is_none());
+        permits.pop();
+        assert!(Permit::take(&active).is_some());
+        drop(permits);
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 }
 
@@ -180,7 +332,10 @@ impl Flags {
                     continue;
                 }
             };
-            let v = args.get(i + 1).filter(|v| !v.starts_with("--")).ok_or_else(|| format!("{} needs a value", args[i]))?;
+            let v = args
+                .get(i + 1)
+                .filter(|v| !v.starts_with("--"))
+                .ok_or_else(|| format!("{} needs a value", args[i]))?;
             *slot = Some(v.clone());
             args.drain(i..i + 2);
         }
