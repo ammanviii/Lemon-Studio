@@ -2933,6 +2933,7 @@ dependencies = [
  "cpal",
  "crossbeam-queue",
  "flacenc",
+ "getrandom 0.4.3",
  "jpeg-decoder",
  "lemon-3x-osc",
  "lemon-balance",

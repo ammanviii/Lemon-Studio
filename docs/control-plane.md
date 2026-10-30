@@ -172,3 +172,17 @@ call("apply", commands=[
   sample tags.
 - Rendering through the control plane, and pushing events to clients (they poll `events`). A parameter changed in a
   plugin's window is an undo step but not an `edit` event.
+
+## Connection limits
+
+The listener accepts at most 16 simultaneous connections. Each request is limited to 1 MiB including its newline,
+and its request queue is bounded. A connection may wait idle for five minutes; once a frame starts, socket reads
+and frame processing use 30-second timeouts. Writes and waiting for a UI reply are limited to 30 seconds too.
+Disconnected connections keep no client state in the UI thread, and a busy client cannot drain a tick forever.
+
+A second instance refuses a Unix socket that is still serving another process. A refused connection to an abandoned
+socket permits its removal; other filesystem entries and permission errors are left alone. TCP tokens are generated
+from operating-system randomness, and the listener still binds only to `127.0.0.1`.
+
+A client whose connection closes must reconnect and authenticate again. If a mutation was sent before a timeout or
+disconnect, its outcome can be unknown: inspect `state`, `history` or `events` before deciding whether to repeat it.

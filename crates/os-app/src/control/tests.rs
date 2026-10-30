@@ -1,4 +1,5 @@
 // Copyright (C) 2026 thacer13
+// Copyright (C) 2026 Ammanuel Getenet
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
@@ -595,6 +596,33 @@ fn a_file_in_the_socket_s_place_is_left_alone() {
     assert!(server::start(path.to_str().unwrap(), Level::Edit, || {}).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), b"a project");
     let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_live_socket_is_not_replaced_by_a_second_instance() {
+    let path = std::env::temp_dir().join(format!("lemon-control-live-{}.sock", std::process::id()));
+    let _server = server::start(path.to_str().unwrap(), Level::Read, || {}).unwrap();
+    assert_eq!(server::start(path.to_str().unwrap(), Level::Read, || {}).err().unwrap().kind(), std::io::ErrorKind::AddrInUse);
+    assert!(std::os::unix::net::UnixStream::connect(&path).is_ok(), "first listener is still reachable");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn oversized_unauthenticated_tcp_requests_are_closed_before_reaching_the_ui() {
+    use std::io::{Read, Write};
+    let server = server::start("0", Level::Read, || {}).unwrap();
+    let mut stream = std::net::TcpStream::connect(&server.at).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    stream.write_all(&vec![b'x'; server::MAX_LINE_BYTES]).unwrap();
+    let _ = stream.write_all(b"x");
+    match stream.read(&mut [0u8; 1]) {
+        Ok(0) => {},
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) => {},
+        other => panic!("oversized client was not disconnected: {other:?}"),
+    }
+    assert!(matches!(server.rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
 }
 
 #[test]
