@@ -2985,6 +2985,7 @@ dependencies = [
  "serde",
  "serde_json",
  "softbuffer",
+ "tempfile",
  "tesla",
  "tiny-skia",
  "vorbis_rs",

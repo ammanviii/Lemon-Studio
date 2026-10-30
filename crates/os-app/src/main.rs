@@ -1,5 +1,6 @@
 // Copyright (C) 2026 ItsAlphaNeon
 // Copyright (C) 2026 thacer13
+// Copyright (C) 2026 Ammanuel Getenet
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
@@ -19,6 +20,7 @@ mod audio_cfg;
 mod auto_close;
 mod autoscroll;
 mod backup;
+mod project_write;
 #[cfg(test)]
 mod audio_bench;
 #[cfg(test)]
