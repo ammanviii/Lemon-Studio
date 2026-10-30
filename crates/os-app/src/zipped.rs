@@ -1,4 +1,5 @@
 // Copyright (C) 2026 ItsAlphaNeon
+// Copyright (C) 2026 Ammanuel Getenet
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
@@ -23,6 +24,10 @@ use crate::dialog::{spans, Kind, Then};
 /// Where a zip is unzipped when its own folder cannot be written to (a read-only drive, say): this folder in the user
 /// folder.
 const UNZIP_DIR: &str = "Unzipped projects";
+/// Import budgets are checked before creating output folders, then enforced against the decoded stream too.
+const MAX_ZIP_FILES: usize = 10_000;
+const MAX_ZIP_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ZIP_TOTAL_BYTES: u64 = 4 * MAX_ZIP_FILE_BYTES;
 /// Files already compressed are stored as they are.
 const STORED: &[&str] = &["mp3", "ogg", "flac", "m4a", "aac", "opus", "zip"];
 
@@ -87,13 +92,22 @@ type Entry = (usize, PathBuf, u64);
 /// the one nearest the top of the zip (then by name). Names that would leave the folder are skipped.
 pub fn unzip(zip: &Path, fallback: Option<&Path>, done: &AtomicU64, total: &AtomicU64) -> Result<PathBuf, String> {
     let mut a = zip::ZipArchive::new(io::BufReader::new(File::open(zip).map_err(|e| e.to_string())?)).map_err(|e| e.to_string())?;
+    if a.len() > MAX_ZIP_FILES {
+        return Err(format!("project zip has more than {MAX_ZIP_FILES} entries"));
+    }
     let mut entries: Vec<Entry> = Vec::new();
+    let mut bytes = 0u64;
     for i in 0..a.len() {
         let f = a.by_index_raw(i).map_err(|e| e.to_string())?;
         if f.is_dir() {
             continue;
         }
         if let Some(rel) = f.enclosed_name() {
+            if f.size() > MAX_ZIP_FILE_BYTES {
+                return Err("project zip has a file larger than 1 GiB".into());
+            }
+            bytes = bytes.checked_add(f.size()).filter(|n| *n <= MAX_ZIP_TOTAL_BYTES)
+                .ok_or("project zip expands to more than 4 GiB")?;
             entries.push((i, rel, f.size()));
         }
     }
@@ -103,7 +117,7 @@ pub fn unzip(zip: &Path, fallback: Option<&Path>, done: &AtomicU64, total: &Atom
         .min_by_key(|e| (e.1.components().count(), e.1.to_string_lossy().to_lowercase()))
         .map(|e| e.1.clone())
         .ok_or_else(|| "it holds no FLP project".to_string())?;
-    total.store(entries.iter().map(|e| e.2).sum(), Ordering::Relaxed);
+    total.store(bytes, Ordering::Relaxed);
     let stem = zip.file_stem().map_or_else(|| "Project".to_string(), |s| s.to_string_lossy().into_owned());
     let beside = zip.parent().map(|d| if d.as_os_str().is_empty() { Path::new(".") } else { d });
     let mut first_error = None;
@@ -150,8 +164,15 @@ fn unzip_into<R: Read + io::Seek>(a: &mut zip::ZipArchive<R>, entries: &[Entry],
         let mut part = out.clone().into_os_string();
         part.push(".part");
         let part = PathBuf::from(part);
-        let mut f = a.by_index(*i).map_err(|e| err(rel, &e))?;
-        let written = File::create(&part).and_then(|w| copy(&mut f, io::BufWriter::new(w), done)).and_then(|()| std::fs::rename(&part, &out));
+        // Decode at most the declared size plus one byte; a dishonest header cannot escape the budget.
+        let mut f = a.by_index(*i).map_err(|e| err(rel, &e))?.take(*size + 1);
+        let before = done.load(Ordering::Relaxed);
+        let written = File::create(&part).and_then(|w| copy(&mut f, io::BufWriter::new(w), done)).and_then(|()| {
+            if done.load(Ordering::Relaxed) - before != *size {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "zip entry differs from its declared size"));
+            }
+            std::fs::rename(&part, &out)
+        });
         if let Err(e) = written {
             let _ = std::fs::remove_file(&part);
             return Err(err(&out, &e));
@@ -385,6 +406,53 @@ mod tests {
     fn names(zip: &Path) -> Vec<String> {
         let mut a = zip::ZipArchive::new(File::open(zip).unwrap()).unwrap();
         (0..a.len()).map(|i| a.by_index(i).unwrap().name().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn oversized_archives_are_rejected_before_creating_output() {
+        let d = temp("limits");
+        let zip = d.join("Oversized.zip");
+        make_zip(&zip, &[("Song.flp", b"song")]);
+        let mut bytes = std::fs::read(&zip).unwrap();
+        let central = bytes.windows(4).position(|b| b == b"PK\x01\x02").unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&((MAX_ZIP_FILE_BYTES + 1) as u32).to_le_bytes());
+        std::fs::write(&zip, bytes).unwrap();
+        let (done, total) = (AtomicU64::new(0), AtomicU64::new(0));
+        assert!(unzip(&zip, None, &done, &total).unwrap_err().contains("1 GiB"));
+        assert!(!d.join("Oversized").exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn the_total_zip_budget_is_checked_before_extraction() {
+        let d = temp("total_limit");
+        let zip = d.join("Large pack.zip");
+        make_zip(&zip, &[("Song.flp", b"s"), ("One.wav", b"1"), ("Two.wav", b"2"), ("Three.wav", b"3"), ("Four.wav", b"4")]);
+        let mut bytes = std::fs::read(&zip).unwrap();
+        let headers: Vec<usize> = bytes.windows(4).enumerate().filter_map(|(i, b)| (b == b"PK\x01\x02").then_some(i)).collect();
+        for central in headers {
+            bytes[central + 24..central + 28].copy_from_slice(&(MAX_ZIP_FILE_BYTES as u32).to_le_bytes());
+        }
+        std::fs::write(&zip, bytes).unwrap();
+        let (done, total) = (AtomicU64::new(0), AtomicU64::new(0));
+        assert!(unzip(&zip, None, &done, &total).unwrap_err().contains("4 GiB"));
+        assert!(!d.join("Large pack").exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn too_many_zip_entries_are_rejected_before_extraction() {
+        let d = temp("entry_limit");
+        let zip = d.join("Many entries.zip");
+        let mut w = zip::ZipWriter::new(File::create(&zip).unwrap());
+        for n in 0..=MAX_ZIP_FILES {
+            w.start_file(format!("{n}.flp"), zip::write::SimpleFileOptions::default()).unwrap();
+        }
+        w.finish().unwrap();
+        let (done, total) = (AtomicU64::new(0), AtomicU64::new(0));
+        assert!(unzip(&zip, None, &done, &total).unwrap_err().contains("entries"));
+        assert!(!d.join("Many entries").exists());
+        let _ = std::fs::remove_dir_all(d);
     }
 
     /// A zip unzips beside itself and the project nearest its top is the one opened; names leaving the folder are
